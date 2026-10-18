@@ -1,0 +1,6 @@
+[Unit]
+Description=Render today's Rosary theme wallpaper
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c '[[ $(cat %h/.local/state/omarchy/current/theme.name) == rosary ]] && %h/.local/bin/rosary-wallpaper today --apply || true'

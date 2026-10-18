@@ -1,0 +1,613 @@
+#!/usr/bin/env python3
+"""Render a rosary wallpaper for the Omarchy "rosary" theme.
+
+  rosary-wallpaper today [--no-gospel] [--apply] [--page FILE] [--date YYYY-MM-DD] [--out FILE [--size WxH]]
+        daily image: the day's mysteries + fruits + USCCB Gospel, tinted by liturgical season.
+        --apply also sets the wallpaper and re-tints the theme when the season changes.
+  rosary-wallpaper static DIR    one rosary-only image per mystery set
+  rosary-wallpaper season [YYYY-MM-DD]    print the liturgical season and mysteries for a day
+  rosary-wallpaper style [standard|soft]   show or set the color style (soft = dusty, low contrast)
+        Any command also accepts --style standard|soft to override it once.
+
+Every image is also rendered for each monitor size seen (screens/<W>x<H>/ beside it);
+the patched <user>.background shell plugin (see install.sh) shows each screen its variant.
+
+Art is drawn as SVG and rasterized with rsvg-convert.
+"""
+import datetime, html, json, os, re, subprocess, sys, tempfile, textwrap
+from math import cos, sin, pi, hypot
+
+W, H = 3440, 1440
+SERIF = "Noto Serif"
+
+MYSTERIES = {
+    "joyful": ("The Joyful Mysteries", [
+        ("The Annunciation", "Humility"),
+        ("The Visitation", "Love of Neighbor"),
+        ("The Nativity", "Poverty of Spirit"),
+        ("The Presentation in the Temple", "Obedience"),
+        ("The Finding in the Temple", "Joy in Finding Jesus")]),
+    "sorrowful": ("The Sorrowful Mysteries", [
+        ("The Agony in the Garden", "Sorrow for Sin"),
+        ("The Scourging at the Pillar", "Purity"),
+        ("The Crowning with Thorns", "Courage"),
+        ("The Carrying of the Cross", "Patience"),
+        ("The Crucifixion", "Perseverance")]),
+    "glorious": ("The Glorious Mysteries", [
+        ("The Resurrection", "Faith"),
+        ("The Ascension", "Hope"),
+        ("The Descent of the Holy Spirit", "Love of God"),
+        ("The Assumption", "Grace of a Happy Death"),
+        ("The Coronation of Mary", "Trust in Mary’s Intercession")]),
+    "luminous": ("The Luminous Mysteries", [
+        ("The Baptism of the Lord", "Openness to the Holy Spirit"),
+        ("The Wedding at Cana", "To Jesus through Mary"),
+        ("The Proclamation of the Kingdom", "Repentance"),
+        ("The Transfiguration", "Desire for Holiness"),
+        ("The Institution of the Eucharist", "Adoration")]),
+}
+
+# Gentle palettes: sky gradient (top, bottom), accent, ink
+PALETTES = {
+    # one per mystery set, for the static backgrounds
+    "joyful":    (("#2c3d5e", "#0e1424"), "#e3cf9c", "#f3ecdc"),
+    "sorrowful": (("#45293a", "#140b11"), "#d9b49a", "#f1e4e0"),
+    "glorious":  (("#3b3658", "#110f1c"), "#ecd9a6", "#f6f0e2"),
+    "luminous":  (("#2a4a4c", "#0b1616"), "#e6d7a4", "#eef3ea"),
+    # one per liturgical season, for the daily image and theme colors
+    "advent":    (("#34315a", "#100f1f"), "#cdbfe6", "#efeaf7"),
+    "rose":      (("#583645", "#1a0f15"), "#efc2cf", "#f8eef1"),
+    "christmas": (("#3d4562", "#12141f"), "#efdcaa", "#fbf6ea"),
+    "lent":      (("#3e2f47", "#130e17"), "#cbb6d3", "#efe7f1"),
+    "easter":    (("#4b4862", "#15141d"), "#f3e2ad", "#fdf9ee"),
+    "pentecost": (("#563236", "#190d0f"), "#f1c79f", "#fbefe6"),
+    "ordinary":  (("#2f4a3d", "#0d1612"), "#d3dcb5", "#eef2e6"),
+}
+BEAD_GOLD = "#d8bf86"
+
+STYLE_FILE = os.path.expanduser("~/.config/rosary-wallpaper/style")
+STYLE = "standard"
+
+
+def adjust(c, light=None, sat=1.0, lift=0.0):
+    """Scale saturation, then raise lightness by `lift` (or set it to `light`)."""
+    import colorsys
+    r, g, b = (int(c[i:i + 2], 16) / 255 for i in (1, 3, 5))
+    h, l, s_ = colorsys.rgb_to_hls(r, g, b)
+    l = light if light is not None else min(1.0, l + lift)
+    r, g, b = colorsys.hls_to_rgb(h, l, s_ * sat)
+    return "#" + "".join(f"{round(x * 255):02x}" for x in (r, g, b))
+
+
+def palette(key):
+    """The palette for `key`, softened into dusty pastels in the soft style."""
+    (top, bottom), accent, ink = PALETTES[key]
+    if STYLE != "soft":
+        return (top, bottom), accent, ink
+    top = adjust(top, sat=.55, lift=.12)
+    bottom = mix(adjust(bottom, sat=.5, lift=.10), top, .35)
+    accent = mix(adjust(accent, sat=.6), top, .18)
+    ink = mix(ink, top, .26)
+    return (top, bottom), accent, ink
+
+
+# Monday=0 ... Sunday=6 (traditional weekly cycle)
+WEEKDAY = ["joyful", "sorrowful", "glorious", "luminous", "sorrowful", "joyful", "glorious"]
+ROMAN = ["I", "II", "III", "IV", "V"]
+
+CACHE = os.path.expanduser("~/.cache/rosary-theme")
+USER_BG = os.path.expanduser("~/.config/omarchy/backgrounds/rosary")
+
+
+def esc(s):
+    return html.escape(s, quote=True)
+
+
+# ------------------------------------------------------ Liturgical year ---
+D = datetime.date
+DAY = datetime.timedelta(days=1)
+
+
+def easter(y):
+    # Anonymous Gregorian algorithm
+    a, b, c = y % 19, y // 100, y % 100
+    d, e = b // 4, b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = c // 4, c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    n = h + l - 7 * m + 114
+    return D(y, n // 31, n % 31 + 1)
+
+
+def sunday_on_or_before(d):
+    return d - (d.weekday() + 1) % 7 * DAY
+
+
+def baptism_of_the_lord(y):
+    # US: Epiphany is the Sunday from Jan 2-8; Baptism is the next day if
+    # Epiphany falls on Jan 7 or 8, otherwise the following Sunday.
+    epiphany = sunday_on_or_before(D(y, 1, 8))
+    return epiphany + (DAY if epiphany.day >= 7 else 7 * DAY)
+
+
+def season(d):
+    """(palette key, label) for the liturgical season of date d."""
+    advent1 = sunday_on_or_before(D(d.year, 12, 3))
+    e = easter(d.year)
+    if advent1 <= d < D(d.year, 12, 25):
+        if d == advent1 + 14 * DAY:
+            return "rose", "Gaudete Sunday · Third Sunday of Advent"
+        return "advent", "Season of Advent"
+    if d >= D(d.year, 12, 25) or d <= baptism_of_the_lord(d.year):
+        return "christmas", "Christmas Season"
+    if e - 46 * DAY <= d < e:
+        if d == e - 21 * DAY:
+            return "rose", "Laetare Sunday · Fourth Sunday of Lent"
+        if d >= e - 7 * DAY:
+            return "lent", "Holy Week"
+        return "lent", "Season of Lent"
+    if d == e + 49 * DAY:
+        return "pentecost", "Pentecost Sunday"
+    if e <= d < e + 49 * DAY:
+        return "easter", "Easter Season"
+    return "ordinary", "Ordinary Time"
+
+
+def mysteries_for(d, season_key):
+    if d.weekday() == 6:  # Sunday follows the season
+        if season_key in ("advent", "christmas") or (season_key == "rose" and d.month == 12):
+            return "joyful"
+        if season_key == "lent" or season_key == "rose":
+            return "sorrowful"
+    return WEEKDAY[d.weekday()]
+
+
+def mix(a, b, t):
+    a, b = [int(a[i:i + 2], 16) for i in (1, 3, 5)], [int(b[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#" + "".join(f"{round(x + (y - x) * t):02x}" for x, y in zip(a, b))
+
+
+def contrast(a, b):
+    def lum(c):
+        v = [int(c[i:i + 2], 16) / 255 for i in (1, 3, 5)]
+        v = [x / 12.92 if x <= .03928 else ((x + .055) / 1.055) ** 2.4 for x in v]
+        return .2126 * v[0] + .7152 * v[1] + .0722 * v[2]
+    lo, hi = sorted((lum(a), lum(b)))
+    return (hi + .05) / (lo + .05)
+
+
+SOFT_TERMINAL_CONTRAST = 6.8  # soft style: lift terminal text to this ratio against its background
+
+
+ANSI = {
+    "red": "#d58a96", "yellow": "#e2cf9a", "orange": "#deae86", "green": "#a9c29c",
+    "cyan": "#97c2c6", "blue": "#9cb2d9", "magenta": "#c4a8d4", "brown": "#9a7b55",
+    "bright_red": "#e6a6b0", "bright_yellow": "#eedcb0", "bright_green": "#c0d6b4",
+    "bright_cyan": "#b2d6d9", "bright_blue": "#b8cbe8", "bright_magenta": "#d7c0e2",
+}
+
+
+def colors_toml(key):
+    (top, _), accent, ink = palette(key)
+    soft = STYLE == "soft"
+    darken = (.3, .4, .5, .14) if soft else (.5, .62, .74, .25)
+    bg = mix(top, '#000000', darken[0])
+    ansi = {n: (mix(adjust(c, sat=.7), bg, .18) if soft else c) for n, c in ANSI.items()}
+    fg = ink
+    if soft:
+        t = 0.0
+        while contrast(fg, bg) < SOFT_TERMINAL_CONTRAST and t < 1:
+            t += .01
+            fg = mix(ink, "#ffffff", t)
+    body = "\n".join(f'{n} = "{c}"' + ("\n" if n in ("brown",) else "") for n, c in ansi.items())
+    return f"""# season: {key} {STYLE}
+# Rosary — generated by rosary-wallpaper; re-tinted each liturgical season
+mode = "dark"
+
+accent = "{accent}"
+selection = "{mix(top, accent, .28)}"
+muted = "{mix(top, ink, .38)}"
+
+background = "{bg}"
+dark_background = "{mix(top, '#000000', darken[1])}"
+darker_background = "{mix(top, '#000000', darken[2])}"
+lighter_background = "{mix(top, '#000000', darken[3])}"
+
+foreground = "{fg}"
+dark_foreground = "{mix(ink, top, .45)}"
+light_foreground = "{mix(ink, top, .12)}"
+bright_foreground = "{mix(fg, '#ffffff', .12 if soft else .4)}"
+
+{body}
+"""
+
+
+# ---------------------------------------------------------------- Gospel ---
+def fetch_gospel(day, page_file=None):
+    os.makedirs(CACHE, exist_ok=True)
+    code = day.strftime("%m%d%y")
+    cached = os.path.join(CACHE, f"{code}.json")
+    if os.path.exists(cached):
+        with open(cached) as f:
+            return json.load(f)
+    url = f"https://bible.usccb.org/bible/readings/{code}.cfm"
+    if page_file:
+        page = open(page_file, encoding="utf-8", errors="replace").read()
+    else:
+        page = subprocess.run(["curl", "-fsSL", "--max-time", "20", "-A", "Mozilla/5.0", url],
+                              check=True, capture_output=True).stdout.decode("utf-8", "replace")
+
+    title = re.search(r"<h2>\s*(.*?)\s*</h2>", page, re.S)
+    i = page.find('<h3 class="name">Gospel')
+    if i < 0:
+        return None
+    block = page[i:]
+    ref = re.search(r'<div class="address">.*?<a[^>]*>(.*?)</a>', block, re.S)
+    body = re.search(r'<div class="content-body">(.*?)</div>', block, re.S)
+    paragraphs = []
+    for p in re.findall(r"<p>(.*?)</p>", body.group(1), re.S):
+        lines = [html.unescape(re.sub(r"<[^>]+>", "", l)).replace("\xa0", " ").strip()
+                 for l in re.split(r"<br\s*/?>", p)]
+        lines = [l for l in lines if l]
+        if lines:
+            paragraphs.append(lines)
+    g = {
+        "day_title": html.unescape(re.sub(r"\s+", " ", title.group(1))).strip() if title else "",
+        "reference": html.unescape(ref.group(1)).strip() if ref else "",
+        "paragraphs": paragraphs,
+        "url": url,
+    }
+    with open(cached, "w") as f:
+        json.dump(g, f)
+    return g
+
+
+def layout_gospel(paragraphs, box_w, box_h, max_fs=44, min_fs=24):
+    """Pick the largest font size whose wrapped text fits the box.
+
+    Returns (font size, line height, lines, truncated); None in lines is a paragraph gap.
+    A Gospel too long even at min_fs is cut at a line end."""
+    for fs in range(max_fs, min_fs - 1, -1):
+        cols = int(box_w / (fs * 0.47))
+        lh = fs * 1.42
+        out = []
+        for i, para in enumerate(paragraphs):
+            if i:
+                out.append(None)  # paragraph gap
+            for line in para:
+                out.extend(textwrap.wrap(line, cols, subsequent_indent="   ") or [""])
+        height = sum(lh if l is not None else lh * 0.55 for l in out)
+        if height <= box_h:
+            return fs, lh, out, False
+    kept, height = [], 2 * lh  # leave room for the closing note
+    for l in out:
+        height += lh if l is not None else lh * 0.55
+        if height > box_h:
+            break
+        kept.append(l)
+    while kept and kept[-1] is None:
+        kept.pop()
+    return fs, lh, kept + ["\u2026"], True
+
+
+# ------------------------------------------------------------------- Art ---
+def ellipse_points(cx, cy, rx, ry, n, gap):
+    """n points spaced evenly by arc length along an ellipse, leaving a gap at the bottom."""
+    samples = []
+    steps = 4000
+    for k in range(steps + 1):
+        t = pi / 2 + gap + (2 * pi - 2 * gap) * k / steps
+        samples.append((cx + rx * cos(t), cy + ry * sin(t)))
+    dist = [0.0]
+    for a, b in zip(samples, samples[1:]):
+        dist.append(dist[-1] + hypot(b[0] - a[0], b[1] - a[1]))
+    total = dist[-1]
+    pts, j = [], 0
+    for k in range(n):
+        target = total * k / (n - 1)
+        while dist[j] < target and j < len(dist) - 1:
+            j += 1
+        pts.append(samples[j])
+    return pts
+
+
+def bead(x, y, r, grad):
+    return (f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{r * 1.25:.1f}" fill="#000" opacity=".28"/>'
+            f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{r:.1f}" fill="url(#{grad})"/>')
+
+
+def cross(x, y, s, gold):
+    # Latin cross, top-center at (x, y), height 3.2*s
+    w, arm = s * 0.34, s * 2.0
+    v = f'<rect x="{x - w / 2:.1f}" y="{y:.1f}" width="{w:.1f}" height="{s * 3.2:.1f}" rx="{w * .25:.1f}"/>'
+    h = f'<rect x="{x - arm / 2:.1f}" y="{y + s * .7:.1f}" width="{arm:.1f}" height="{w:.1f}" rx="{w * .25:.1f}"/>'
+    return f'<g fill="url(#gold)" stroke="{gold}" stroke-width="2" filter="url(#soft)">{v}{h}</g>'
+
+
+def rosary_svg(cx, cy, scale, accent):
+    rx, ry = 330 * scale, 400 * scale
+    small, large = 11 * scale, 17 * scale
+    # Loop sequence: decade, OF, decade, OF, decade, OF, decade, OF, decade
+    seq = []
+    for d in range(5):
+        seq += ["s"] * 10
+        if d < 4:
+            seq.append("L")
+    pts = ellipse_points(cx, cy, rx, ry, len(seq), gap=0.16)
+    center = (cx, cy + ry + 26 * scale)
+    parts = []
+    chain = " ".join(f"{x:.1f},{y:.1f}" for x, y in [center] + pts + [center])
+    parts.append(f'<polyline points="{chain}" fill="none" stroke="{accent}" stroke-opacity=".55" stroke-width="{1.6 * scale:.1f}"/>')
+    # Pendant: centerpiece -> large -> 3 small -> large -> cross
+    py = [center[1] + o * scale for o in (70, 120, 160, 200, 255)]
+    parts.append(f'<line x1="{cx}" y1="{center[1]:.1f}" x2="{cx}" y2="{py[-1] + 30 * scale:.1f}" stroke="{accent}" stroke-opacity=".55" stroke-width="{1.6 * scale:.1f}"/>')
+    for (x, y), kind in zip(pts, seq):
+        parts.append(bead(x, y, large if kind == "L" else small, "pearl" if kind == "s" else "goldbead"))
+    for y, r in zip(py, (large, small, small, small, large)):
+        parts.append(bead(cx, y, r, "goldbead" if r == large else "pearl"))
+    # Centerpiece medal with Marian monogram
+    mx, my = center
+    parts.append(f'<g filter="url(#soft)"><ellipse cx="{mx}" cy="{my:.1f}" rx="{30 * scale:.1f}" ry="{38 * scale:.1f}" fill="url(#gold)" stroke="{accent}" stroke-width="2"/>'
+                 f'<text x="{mx}" y="{my + 14 * scale:.1f}" font-family="{SERIF}" font-size="{40 * scale:.0f}" text-anchor="middle" fill="#3b2a0a" font-weight="bold">M</text></g>')
+    parts.append(cross(cx, py[-1] + 30 * scale, 62 * scale, accent))
+    return "\n".join(parts)
+
+
+def stars(seed, n, x0, x1):
+    import random
+    rnd = random.Random(seed)
+    out = []
+    for _ in range(n):
+        x, y = rnd.uniform(x0, x1), rnd.uniform(0, H)
+        out.append(f'<circle cx="{x:.0f}" cy="{y:.0f}" r="{rnd.uniform(.6, 2.0):.1f}" fill="#fff" opacity="{rnd.uniform(.04, .18 if STYLE == "soft" else .32):.2f}"/>')
+    return "".join(out)
+
+
+def defs(bg, accent):
+    top, bottom = bg
+    return f'''<defs>
+<radialGradient id="sky" cx="22%" cy="45%" r="85%">
+  <stop offset="0" stop-color="{top}"/><stop offset="1" stop-color="{bottom}"/></radialGradient>
+<radialGradient id="halo" cx="50%" cy="50%" r="50%">
+  <stop offset="0" stop-color="{accent}" stop-opacity=".16"/><stop offset="1" stop-color="{accent}" stop-opacity="0"/></radialGradient>
+<radialGradient id="pearl" cx="35%" cy="30%" r="70%">
+  <stop offset="0" stop-color="{"#ebe6dc" if STYLE == "soft" else "#ffffff"}"/><stop offset=".45" stop-color="{"#d6d0c4" if STYLE == "soft" else "#e9e3d6"}"/><stop offset="1" stop-color="#8f8a80"/></radialGradient>
+<radialGradient id="goldbead" cx="35%" cy="30%" r="70%">
+  <stop offset="0" stop-color="#fff8e2"/><stop offset=".5" stop-color="{mix(BEAD_GOLD, top, .2) if STYLE == "soft" else BEAD_GOLD}"/><stop offset="1" stop-color="#7a6236"/></radialGradient>
+<linearGradient id="gold" x1="0" y1="0" x2="1" y2="1">
+  <stop offset="0" stop-color="#fff4d6"/><stop offset=".5" stop-color="{mix(BEAD_GOLD, top, .2) if STYLE == "soft" else BEAD_GOLD}"/><stop offset="1" stop-color="#8f7442"/></linearGradient>
+<filter id="soft" x="-50%" y="-50%" width="200%" height="200%">
+  <feDropShadow dx="0" dy="3" stdDeviation="4" flood-color="#000" flood-opacity="{.2 if STYLE == "soft" else .35}"/></filter>
+</defs>'''
+
+
+def layout(vw):
+    """Positions and type sizes for a canvas vw wide and H (1440) tall."""
+    if vw >= 3000:  # ultrawide: rosary | mysteries | Gospel
+        return dict(rosary=(640, 500, .94), halo=720, tx=1240, date=(34, 8), title=78, roman=30,
+                    name=42, fruit=26, row=102, indent=80, rule=640, season=(30, 5),
+                    day=(30, 52, 42), gx=2200, gw=min(1080, vw - 2360), ghead=(32, 6), gmax=44, gmin=26, gospel=True)
+    return dict(rosary=(round(vw * .145), 536, .72), halo=560, tx=round(vw * .295), date=(28, 6),
+                title=62, roman=26, name=36, fruit=23, row=90, indent=66, rule=520, season=(26, 3),
+                day=(26, 44, 36), gx=round(vw * .65), gw=round(vw * .35) - 110, ghead=(26, 5), gmax=33, gmin=23,
+                gospel=vw >= 1900)
+
+
+def compose(key, palette, day=None, gospel=None, season_label=None, vw=W):
+    title, names = MYSTERIES[key]
+    bg, accent, ink = globals()["palette"](palette)
+    L = layout(vw)
+    if not L["gospel"]:
+        gospel = None
+    o = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{vw}" height="{H}" viewBox="0 0 {vw} {H}">',
+         defs(bg, accent),
+         f'<rect width="{vw}" height="{H}" fill="url(#sky)"/>',
+         stars(key, round(260 * vw / W), 0, vw)]
+    # Rosary on the left with a soft halo behind it
+    rcx, rcy, rs = L["rosary"]
+    o.append(f'<circle cx="{rcx}" cy="{rcy + 220 * rs:.0f}" r="{L["halo"]}" fill="url(#halo)"/>')
+    o.append(rosary_svg(rcx, rcy, rs, accent))
+
+    # Mysteries column, each with its fruit beneath
+    tx, row = L["tx"], L["row"]
+    y = 300 if gospel else 420
+    if day:
+        fs, ls = L["date"]
+        o.append(f'<text x="{tx}" y="{y - 90}" font-family="{SERIF}" font-size="{fs}" letter-spacing="{ls}" fill="{accent}" opacity=".85">'
+                 f'{esc(day.strftime("%A").upper())} \u00b7 {esc(day.strftime("%B %-d, %Y").upper())}</text>')
+    o.append(f'<text x="{tx}" y="{y}" font-family="{SERIF}" font-size="{L["title"]}" font-style="italic" fill="{accent}">{esc(title)}</text>')
+    o.append(f'<line x1="{tx}" y1="{y + 40}" x2="{tx + L["rule"]}" y2="{y + 40}" stroke="{accent}" stroke-opacity=".45" stroke-width="2"/>')
+    for i, (n, fruit) in enumerate(names):
+        yy = y + 120 + i * row
+        o.append(f'<text x="{tx}" y="{yy}" font-family="{SERIF}" font-size="{L["roman"]}" fill="{accent}" opacity=".75">{ROMAN[i]}.</text>'
+                 f'<text x="{tx + L["indent"]}" y="{yy}" font-family="{SERIF}" font-size="{L["name"]}" fill="{ink}">{esc(n)}</text>'
+                 f'<text x="{tx + L["indent"] + 2}" y="{yy + round(L["name"] * .9)}" font-family="{SERIF}" font-size="{L["fruit"]}" font-style="italic" fill="{accent}" opacity="{.9 if STYLE == "soft" else .72}">'
+                 f'Fruit: {esc(fruit)}</text>')
+    yy = y + 120 + 5 * row + 50
+    if season_label:
+        fs, ls = L["season"]
+        o.append(f'<text x="{tx}" y="{yy}" font-family="{SERIF}" font-size="{fs}" letter-spacing="{ls}" fill="{accent}" opacity=".85">{esc(season_label.upper())}</text>')
+        yy += round(fs * 1.6)
+    if gospel and gospel.get("day_title"):
+        fs, wrap, lh = L["day"]
+        for line in textwrap.wrap(gospel["day_title"], wrap):
+            o.append(f'<text x="{tx}" y="{yy}" font-family="{SERIF}" font-size="{fs}" font-style="italic" fill="{ink}" opacity=".7">{esc(line)}</text>')
+            yy += lh
+
+    # Gospel column
+    if gospel and gospel["paragraphs"]:
+        gx, gy, gw, gh = L["gx"], 250, L["gw"], 1000
+        fs, ls = L["ghead"]
+        o.append(f'<text x="{gx}" y="{gy - 30}" font-family="{SERIF}" font-size="{fs}" letter-spacing="{ls}" fill="{accent}">'
+                 f'GOSPEL \u00b7 {esc(gospel["reference"].upper())}</text>')
+        fs, lh, lines, cut = layout_gospel(gospel["paragraphs"], gw, gh - 40, L["gmax"], L["gmin"])
+        text_h = sum(lh if l is not None else lh * 0.55 for l in lines) + (lh if cut else 0)
+        o.append(f'<rect x="{gx - 60}" y="{gy - 110}" width="{gw + 120}" height="{text_h + 170:.0f}" rx="28" fill="#000" opacity="{.1 if STYLE == "soft" else .18}"/>')
+        yy = gy + 40
+        for l in lines:
+            if l is None:
+                yy += lh * 0.55
+                continue
+            o.append(f'<text x="{gx}" y="{yy:.0f}" font-family="{SERIF}" font-size="{fs}" font-style="italic" fill="{ink}" opacity=".92">{esc(l)}</text>')
+            yy += lh
+        if cut:
+            o.append(f'<text x="{gx}" y="{yy:.0f}" font-family="{SERIF}" font-size="{round(fs * .8)}" fill="{accent}" opacity=".85">'
+                     f'Continued \u2014 read the full Gospel at bible.usccb.org</text>')
+    o.append("</svg>")
+    return "\n".join(o)
+
+
+def render(svg, out_png, size=(W, H)):
+    with tempfile.NamedTemporaryFile("w", suffix=".svg", delete=False) as f:
+        f.write(svg)
+        path = f.name
+    try:
+        subprocess.run(["rsvg-convert", "-w", str(size[0]), "-h", str(size[1]), "-o", out_png, path], check=True)
+    finally:
+        os.unlink(path)
+
+
+SCREENS_FILE = os.path.expanduser("~/.config/rosary-wallpaper/screens")
+
+
+def screen_sizes():
+    """[(logical w, logical h, render w, render h)] for each monitor seen.
+
+    Variants are keyed by logical size (what the shell sees) and rendered at logical size
+    times the shell's integer buffer scale, so they stay sharp under fractional scaling.
+    Sizes are remembered so a screen that is unplugged keeps its variants."""
+    from math import ceil
+    sizes = set()
+    try:
+        for entry in open(SCREENS_FILE).read().split():
+            logical, scale = entry.split("@")
+            sizes.add((*map(int, logical.split("x")), int(scale)))
+    except (OSError, ValueError):
+        pass
+    try:
+        mons = json.loads(subprocess.run(["hyprctl", "monitors", "all", "-j"], capture_output=True,
+                                         check=True).stdout)
+        for m in mons:
+            w, h = m["width"], m["height"]
+            if m.get("transform", 0) % 2:
+                w, h = h, w
+            sc = m.get("scale", 1) or 1
+            sizes.add((round(w / sc), round(h / sc), max(1, ceil(sc - 1e-6))))
+    except (OSError, subprocess.CalledProcessError, ValueError, KeyError):
+        pass
+    os.makedirs(os.path.dirname(SCREENS_FILE), exist_ok=True)
+    with open(SCREENS_FILE, "w") as f:
+        f.write("\n".join(f"{w}x{h}@{sc}" for w, h, sc in sorted(sizes)) + "\n")
+    return [(w, h, w * sc, h * sc) for w, h, sc in sorted(sizes)]
+
+
+def emit(make_svg, out):
+    """Render out (W x H) plus screens/<w>x<h>/<name> for each other monitor size.
+
+    make_svg(vw) builds the art for a canvas vw wide and H tall."""
+    render(make_svg(W), out)
+    d, name = os.path.split(out)
+    for w, h, rw, rh in screen_sizes():
+        vdir = os.path.join(d, "screens", f"{w}x{h}")
+        os.makedirs(vdir, exist_ok=True)
+        render(make_svg(round(H * w / h)), os.path.join(vdir, name), (rw, rh))
+
+
+# ------------------------------------------------------------------ Main ---
+def opt(args, name):
+    return args[args.index(name) + 1] if name in args else None
+
+
+def retint_theme(season_key, force=False):
+    """Rewrite the theme's colors for a new season and re-apply it. Returns True if changed."""
+    path = os.path.expanduser("~/.config/omarchy/themes/rosary/colors.toml")
+    try:
+        if not force and open(path).readline().strip() == f"# season: {season_key} {STYLE}":
+            return False
+    except OSError:
+        pass
+    with open(path, "w") as f:
+        f.write(colors_toml(season_key))
+    # The theme-set hook calls us again; colors then match, so it just sets the wallpaper.
+    subprocess.Popen(["omarchy", "theme", "set", "rosary"])
+    return True
+
+
+def cmd_today(args, force_retint=False):
+    day = D.fromisoformat(opt(args, "--date")) if "--date" in args else D.today()
+    season_key, season_label = season(day)
+    key = mysteries_for(day, season_key)
+    gospel = None
+    if "--no-gospel" not in args:
+        try:
+            gospel = fetch_gospel(day, opt(args, "--page"))
+        except Exception as e:  # offline or blocked: fall back to rosary only
+            print(f"Gospel unavailable ({e}); rendering rosary only", file=sys.stderr)
+    def svg(vw=W):
+        return compose(key, season_key, day, gospel, season_label, vw)
+    if "--out" in args:
+        size = tuple(map(int, opt(args, "--size").split("x"))) if "--size" in args else (W, H)
+        render(svg(round(H * size[0] / size[1])), opt(args, "--out"), size)
+        print(opt(args, "--out"))
+        return
+    os.makedirs(USER_BG, exist_ok=True)
+    out = os.path.join(USER_BG, f"0-today-{day.isoformat()}.png")
+    emit(svg, out)
+    for root_, _, files in os.walk(USER_BG):  # keep only today's daily image (and its variants)
+        for f in files:
+            if f.startswith("0-today-") and f != os.path.basename(out):
+                os.unlink(os.path.join(root_, f))
+    print(out)
+    theme = open(os.path.expanduser("~/.local/state/omarchy/current/theme.name")).read().strip()
+    if "--apply" in args and theme == "rosary" and not retint_theme(season_key, force_retint):
+        subprocess.run(["omarchy-theme-bg-set", out])
+
+
+def cmd_static(args):
+    outdir = args[0]
+    os.makedirs(outdir, exist_ok=True)
+    for i, key in enumerate(["joyful", "sorrowful", "glorious", "luminous"], 1):
+        out = os.path.join(outdir, f"{i}-{key}.png")
+        emit(lambda vw, key=key: compose(key, key, vw=vw), out)
+        print(out)
+
+
+def cmd_style(args):
+    global STYLE
+    if not args:
+        print(STYLE)
+        return
+    if args[0] not in ("standard", "soft"):
+        sys.exit("style must be 'standard' or 'soft'")
+    STYLE = args[0]
+    os.makedirs(os.path.dirname(STYLE_FILE), exist_ok=True)
+    with open(STYLE_FILE, "w") as f:
+        f.write(STYLE + "\n")
+    theme_dir = os.path.expanduser("~/.config/omarchy/themes/rosary")
+    cmd_static([os.path.join(theme_dir, "backgrounds")])
+    subprocess.run(["magick", os.path.join(theme_dir, "backgrounds", "1-joyful.png"),
+                    "-resize", "1720x720", os.path.join(theme_dir, "preview.png")], check=True)
+    cmd_today(["--apply"], force_retint=True)
+
+
+def cmd_season(args):
+    day = D.fromisoformat(args[0]) if args else D.today()
+    key, label = season(day)
+    print(f"{day:%a %Y-%m-%d}  {label:<44} {MYSTERIES[mysteries_for(day, key)][0]}")
+
+
+if __name__ == "__main__":
+    cmds = {"today": cmd_today, "static": cmd_static, "season": cmd_season, "style": cmd_style}
+    try:
+        STYLE = open(STYLE_FILE).read().strip() or STYLE
+    except OSError:
+        pass
+    if "--style" in sys.argv:
+        STYLE = opt(sys.argv, "--style")
+    if len(sys.argv) < 2 or sys.argv[1] not in cmds:
+        print(__doc__)
+        sys.exit(1)
+    cmds[sys.argv[1]](sys.argv[2:])
