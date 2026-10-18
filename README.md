@@ -16,8 +16,11 @@ Scripture text: the Gospel is fetched once a day for local display.
 
 ## Install
 
+The repo is private, so sign in to GitHub once on each machine (`gh` ships with Omarchy):
+
 ```bash
-git clone https://github.com/RonHosenfeld/omarchy-rosary.git ~/omarchy-rosary
+gh auth login
+gh repo clone RonHosenfeld/omarchy-rosary ~/omarchy-rosary
 ~/omarchy-rosary/install.sh
 ```
 
