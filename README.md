@@ -16,7 +16,8 @@ Scripture text: the Gospel is fetched once a day for local display.
 
 ## Install
 
-The repo is private, so sign in to GitHub once on each machine (`gh` ships with Omarchy):
+The repo is private, so sign in to GitHub once on each machine with the GitHub CLI
+(install it first if needed: `omarchy pkg add github-cli`):
 
 ```bash
 gh auth login
